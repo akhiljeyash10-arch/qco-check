@@ -1,0 +1,12 @@
+# Prettier ignore — generated / vendored output is left untouched.
+.next/
+node_modules/
+out/
+build/
+coverage/
+package-lock.json
+prisma/migrations/
+playwright-report/
+test-results/
+# Spec artifacts are managed by the spec workflow, not the app formatter.
+.kiro/

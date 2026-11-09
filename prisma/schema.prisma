@@ -1,0 +1,486 @@
+// QCO-Check V1 — Prisma schema
+//
+// Tasks 1-2: health check + auth/tenancy foundation.
+//   - AppMeta — key/value for the health round-trip.
+//   - Firm    — the tenant boundary.
+//   - User    — application user with a Role and an optional firmId. ADMIN users
+//               are platform operators (firmId nullable); USER users belong to
+//               exactly one firm. `passwordHash` backs the credentials login.
+//   - Account / Session / VerificationToken — the models the Auth.js Prisma
+//               adapter expects.
+//
+// Task 3: the full rule data model.
+//   - QCO / ISStandard / QCOItem        — the mandate (legal table + IS numbers).
+//   - EnforcementCircular / TransitionalArrangement — the customs effective date.
+//   - Exemption                         — carve-outs (MSME, end-use, abeyance…).
+//   - Determination / Batch              — firm-scoped outputs of the engine.
+//   - ReviewQueueItem                    — human-in-the-loop for Amber cases.
+//   - AuditLog                           — admin action trail.
+//
+// Key modeling decisions (see design.md):
+//   - Mandate vs. enforcement: QCO holds the legal mandate; EnforcementCircular
+//     holds the customs effective date + transitional arrangement.
+//   - HS code is a hint: spec match (grade/dimensions/material) carries the
+//     decision; QCOItem.hsCodes is JSONB matching guidance only.
+//   - Versioning + point-in-time: QCO carries version/supersession; Determinations
+//     snapshot rule versions (ruleVersionSnapshot) for reproducibility.
+//   - Global rules, tenant determinations: rules are not firm-scoped; determinations
+//     and batches are.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Lightweight app-level key/value store (Task 1 health check round-trip).
+model AppMeta {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("app_meta")
+}
+
+/// Tenant boundary. USER users belong to a firm; ADMIN users are platform
+/// operators with no firm. Determinations/batches are isolated by firm;
+/// rules are a shared, admin-curated knowledge base.
+model Firm {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  users     User[]
+
+  determinations Determination[]
+  batches        Batch[]
+
+  @@map("firms")
+}
+
+/// Application role. USER is firm-scoped (creates determinations); ADMIN is a
+/// platform operator (curates rules, works the review queue, promotes cases).
+enum Role {
+  USER
+  ADMIN
+}
+
+/// Application user. `firmId` is nullable: ADMIN users are platform operators
+/// with no firm; USER users belong to exactly one firm. `passwordHash` is set
+/// for credentials-provider logins. The remaining fields satisfy the Auth.js
+/// Prisma adapter contract and support future OAuth providers.
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  emailVerified DateTime?
+  image         String?
+  /// Bcrypt hash for the credentials provider (Auth.js credentials flow).
+  passwordHash  String?
+  /// Server-authoritative role; never trusted from the client.
+  role          Role      @default(USER)
+  /// Tenant membership. Null for ADMIN platform operators; required for USER.
+  firmId        String?
+  firm          Firm?     @relation(fields: [firmId], references: [id])
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Auth.js Prisma adapter — account/session linkage (OAuth/forward use).
+  accounts Account[]
+  sessions Session[]
+
+  // Task 3 — reverse relations. There are multiple relations between User and
+  // Determination (creator vs. resolver) and between User and other entities, so
+  // every relation pair carries an explicit name.
+  determinations           Determination[]   @relation("DeterminationCreatedBy")
+  resolvedDeterminations   Determination[]   @relation("DeterminationResolvedBy")
+  batches                  Batch[]           @relation("BatchCreatedBy")
+  assignedReviewQueueItems ReviewQueueItem[] @relation("ReviewQueueAssignedAdmin")
+  auditLogs                AuditLog[]        @relation("AuditLogActor")
+
+  @@map("users")
+}
+
+/// Auth.js account model (OAuth/credential linkage). Required by the Prisma
+/// adapter; the credentials provider does not create accounts in V1, but the
+/// model is present for adapter typing and future OAuth providers.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  // Postgres maps Prisma `String` to `text` by default, so the long-lived
+  // OAuth tokens below need no `@db.Text` length override (unlike MySQL).
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+/// Auth.js session model. Present for the Prisma adapter contract; not written
+/// under the JWT session strategy used in V1 (sessions live in the signed JWT).
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+/// Auth.js verification token (magic-link / email flows). Present for the
+/// Prisma adapter contract; not used by the credentials provider in V1.
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 — Rule data model
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of a QCO. DRAFT while curation; PUBLISHED once mandatory;
+/// SUPERSEDED when a later version replaces it; IN_ABEYANCE when enforcement is
+/// judicially/commercially stayed.
+enum QcoStatus {
+  DRAFT
+  PUBLISHED
+  SUPERSEDED
+  IN_ABEYANCE
+}
+
+/// A Quality Control Order — the legal mandate. Holds the product table +
+/// IS numbers + Gazette reference. Immutable once PUBLISHED; edits create a
+/// new version (a new row with an incremented `version`). Supersession is an
+/// explicit self-relation (`supersededBy`).
+model QCO {
+  id               String    @id @default(cuid())
+  title            String
+  issuingAuthority String
+  /// Gazette of India S.O. reference (e.g. "S.O. 1234(E)"). Exact refs are
+  /// marked "VERIFY" in the seed until curation confirms them.
+  gazetteReference String
+  notificationDate DateTime?
+  status           QcoStatus @default(DRAFT)
+  /// Self-relation: the QCO that legally replaces this one (supersession).
+  supersededById   String?
+  supersededBy     QCO?      @relation("QcoSupersession", fields: [supersededById], references: [id])
+  supersedees      QCO[]     @relation("QcoSupersession")
+  /// Version counter; increments when a QCO is amended into a new row.
+  version          Int       @default(1)
+  /// When the QCO itself becomes legally effective (mandate side).
+  effectiveFrom    DateTime?
+  sourceUrl        String?
+  /// The admin user id who curated this row (audit linkage).
+  curatedBy        String?
+  notes            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  qcoItems             QCOItem[]
+  enforcementCirculars EnforcementCircular[]
+  exemptions           Exemption[]
+  determinations       Determination[]
+
+  @@index([status])
+  @@map("qcos")
+}
+
+/// An Indian Standard referenced by one or more QCOItems (e.g. "IS 2062").
+model ISStandard {
+  id          String   @id @default(cuid())
+  /// Canonical IS number, e.g. "IS 2062". Unique so it can be upserted cleanly.
+  isNumber    String   @unique
+  title       String
+  versionYear Int?
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  /// Many-to-many: a QCOItem can reference multiple IS standards, and an IS
+  /// standard applies to many QCOItems. Prisma manages the join table.
+  qcoItems QCOItem[]
+
+  @@map("is_standards")
+}
+
+/// The atomic rule: "a product matching these specs + HS-code hints requires
+/// BIS certification under [IS number] per [QCO]". The spec match (grade /
+/// dimensions / material) carries the decision; `hsCodes` is a matching hint.
+model QCOItem {
+  id                 String   @id @default(cuid())
+  qcoId              String
+  qco                QCO      @relation(fields: [qcoId], references: [id], onDelete: Cascade)
+  productName        String
+  productDescription String?
+  /// JSONB: { grade, dimensions, material }. The spec payload the engine matches.
+  gradeSpec          Json
+  /// JSONB: array of HS-code strings / ranges (e.g. ["7208","7225.11"]).
+  /// Matching hint only — QCOs are written against IS standards, not HS codes.
+  hsCodes            Json     @default("[]")
+  notes              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  /// M-N to ISStandard. Named implicitly by Prisma join table.
+  isStandards ISStandard[]
+
+  /// Determinations that applied this QCOItem as the governing rule.
+  determinations          Determination[]   @relation("DeterminationAppliedRule")
+  /// Determinations promoted from an Amber case into this QCOItem.
+  promotionDeterminations Determination[]   @relation("DeterminationPromotion")
+  /// Review queue items promoted into this QCOItem.
+  reviewQueuePromotions   ReviewQueueItem[] @relation("ReviewQueuePromotion")
+
+  @@index([qcoId])
+  @@map("qco_items")
+}
+
+/// Which trigger date a transitional arrangement keys off.
+enum TriggerDateType {
+  BILL_OF_LADING
+  CLEARANCE_DATE
+  BILL_OF_ENTRY
+  IMPORT_DATE
+}
+
+/// The CBIC instrument that makes a QCO's date effective at customs. Carries
+/// the customs effective date and (optionally) a transitional arrangement
+/// specifying the grace window and the trigger date it keys off.
+model EnforcementCircular {
+  id                String    @id @default(cuid())
+  qcoId             String
+  qco               QCO       @relation(fields: [qcoId], references: [id], onDelete: Cascade)
+  /// CBIC circular reference (e.g. "Circular No. 12/2020-Customs"). Exact refs
+  /// marked "VERIFY" in the seed until curation confirms them.
+  circularReference String
+  circularDate      DateTime?
+  /// The date customs starts enforcing the QCO (the operational effective date).
+  effectiveDate     DateTime?
+  notes             String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  /// One-to-one: a circular carries at most one transitional arrangement.
+  transitionalArrangement TransitionalArrangement?
+  determinations          Determination[]
+
+  @@index([qcoId])
+  @@map("enforcement_circulars")
+}
+
+/// Transitional arrangement tied to an enforcement circular: the grace window
+/// and which shipment date (BL vs. clearance vs. bill of entry vs. import date)
+/// the engine should evaluate against.
+model TransitionalArrangement {
+  id                    String              @id @default(cuid())
+  enforcementCircularId String              @unique
+  enforcementCircular   EnforcementCircular @relation(fields: [enforcementCircularId], references: [id], onDelete: Cascade)
+  triggerDateType       TriggerDateType
+  /// Grace period in days after the effective date (inclusive window).
+  gracePeriodDays       Int                 @default(0)
+  conditionText         String?
+  effectiveFrom         DateTime?
+  effectiveTo           DateTime?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  @@map("transitional_arrangements")
+}
+
+/// Carve-outs from a QCO: MSME phasing, end-use, not-domestically-available,
+/// abeyance, or deferred enforcement.
+enum ExemptionType {
+  MSME_PHASED
+  END_USE
+  NOT_DOMESTICALLY_AVAILABLE
+  ABEYANCE
+  DEFERRED
+}
+
+model Exemption {
+  id            String        @id @default(cuid())
+  qcoId         String
+  qco           QCO           @relation(fields: [qcoId], references: [id], onDelete: Cascade)
+  type          ExemptionType
+  description   String
+  /// JSONB: structured conditions for the exemption (free-form per type).
+  conditions    Json?
+  effectiveFrom DateTime?
+  effectiveTo   DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([qcoId])
+  @@map("exemptions")
+}
+
+/// The applicability verdict returned by the engine.
+enum Verdict {
+  GREEN
+  RED
+  AMBER
+}
+
+/// Lifecycle of a determination: COMPLETED (verdict final), PENDING_REVIEW
+/// (Amber, awaiting admin), RESOLVED (admin finalized).
+enum DeterminationStatus {
+  COMPLETED
+  PENDING_REVIEW
+  RESOLVED
+}
+
+/// A single applicability determination. Firm-scoped (tenant isolation). The
+/// `ruleVersionSnapshot` (JSONB) captures the rule versions active when the
+/// determination was made so it stays reproducible after later amendments.
+model Determination {
+  id                    String               @id @default(cuid())
+  firmId                String
+  firm                  Firm                 @relation(fields: [firmId], references: [id])
+  userId                String
+  user                  User                 @relation("DeterminationCreatedBy", fields: [userId], references: [id])
+  batchId               String?
+  batch                 Batch?               @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  /// JSONB: the user's check input (product type, grade, dimensions, material,
+  /// HS code, clearance date, BL date).
+  input                 Json
+  /// The QCOItem the engine matched and applied (null for Amber/no-match).
+  qcoItemId             String?
+  qcoItem               QCOItem?             @relation("DeterminationAppliedRule", fields: [qcoItemId], references: [id])
+  qcoId                 String?
+  qco                   QCO?                 @relation(fields: [qcoId], references: [id])
+  /// The enforcement circular that made the date effective (null for no-match).
+  enforcementCircularId String?
+  enforcementCircular   EnforcementCircular? @relation(fields: [enforcementCircularId], references: [id])
+  verdict               Verdict
+  /// Confidence score in [0,1] from the engine's spec match.
+  confidence            Float                @default(0)
+  isNumber              String?
+  gazetteReference      String?
+  circularReference     String?
+  transitionalStatus    String?
+  /// JSONB: the engine's step-by-step reasoning trace (legal defensibility).
+  reasoningTrace        Json?
+  status                DeterminationStatus  @default(COMPLETED)
+  /// JSONB: snapshot of the rule versions active as of the applicable date —
+  /// guarantees point-in-time reproducibility after later amendments.
+  ruleVersionSnapshot   Json?
+  /// S3 object key for the generated determination PDF, when cloud storage is enabled.
+  pdfS3Key              String?
+  createdAt             DateTime             @default(now())
+  resolvedAt            DateTime?
+  /// The admin who resolved a PENDING_REVIEW determination.
+  resolvedByAdminId     String?
+  resolvedByAdmin       User?                @relation("DeterminationResolvedBy", fields: [resolvedByAdminId], references: [id])
+  /// The QCOItem promoted from this determination's Amber case (if any).
+  promotionQcoItemId    String?
+  promotionQcoItem      QCOItem?             @relation("DeterminationPromotion", fields: [promotionQcoItemId], references: [id])
+  /// A determination raises at most one review-queue item.
+  reviewQueueItem       ReviewQueueItem?
+
+  @@index([firmId])
+  @@index([userId])
+  @@index([batchId])
+  @@index([verdict])
+  @@map("determinations")
+}
+
+/// Status of a CSV batch run.
+enum BatchStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+/// A CSV batch upload that produced many determinations. Firm-scoped.
+model Batch {
+  id        String      @id @default(cuid())
+  firmId    String
+  firm      Firm        @relation(fields: [firmId], references: [id])
+  userId    String
+  user      User        @relation("BatchCreatedBy", fields: [userId], references: [id])
+  fileName  String
+  totalRows Int         @default(0)
+  status    BatchStatus @default(PROCESSING)
+  /// S3 object key for the generated results CSV, when cloud storage is enabled.
+  s3Key     String?
+  createdAt DateTime    @default(now())
+
+  determinations Determination[]
+
+  @@index([firmId])
+  @@index([userId])
+  @@map("batches")
+}
+
+/// Status of a human-in-the-loop review item.
+enum ReviewQueueStatus {
+  PENDING
+  RESOLVED
+  PROMOTED
+}
+
+/// An Amber determination routed for expert review. The admin resolves the
+/// verdict and may promote the decision into a new QCOItem (linked back here).
+model ReviewQueueItem {
+  id                String            @id @default(cuid())
+  /// One-to-one with the Amber determination.
+  determinationId   String            @unique
+  determination     Determination     @relation(fields: [determinationId], references: [id], onDelete: Cascade)
+  status            ReviewQueueStatus @default(PENDING)
+  /// The admin assigned to resolve this case.
+  assignedAdminId   String?
+  assignedAdmin     User?             @relation("ReviewQueueAssignedAdmin", fields: [assignedAdminId], references: [id])
+  /// The admin's final verdict for this Amber case.
+  resolutionVerdict Verdict?
+  /// The QCOItem created by promoting this case into the rule base.
+  promotedQcoItemId String?
+  promotedQcoItem   QCOItem?          @relation("ReviewQueuePromotion", fields: [promotedQcoItemId], references: [id])
+  adminNotes        String?
+  createdAt         DateTime          @default(now())
+  resolvedAt        DateTime?
+
+  @@index([status])
+  @@map("review_queue_items")
+}
+
+/// Append-only audit trail of admin actions (rule edits, status changes,
+/// queue resolutions, promotions). `before`/`after` capture the diff.
+model AuditLog {
+  id          String   @id @default(cuid())
+  /// The user who performed the action (nullable for system-initiated actions).
+  actorUserId String?
+  actorUser   User?    @relation("AuditLogActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  action      String
+  /// The entity type acted upon (e.g. "QCO", "QCOItem").
+  entity      String
+  entityId    String?
+  /// JSONB: state before the change (null on create).
+  before      Json?
+  /// JSONB: state after the change (null on delete).
+  after       Json?
+  at          DateTime @default(now())
+
+  @@index([actorUserId])
+  @@index([entity, entityId])
+  @@map("audit_logs")
+}
